@@ -1,0 +1,13 @@
+'#testproj':
+  events:
+    - patchset-created
+    - change-merged
+    - ref-updated
+    - change-merged
+    - project-created
+  projects:
+    - testproject
+  branches:
+    - master
+    - development
+    - staging

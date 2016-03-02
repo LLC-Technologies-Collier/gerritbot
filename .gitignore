@@ -1,4 +1,8 @@
+.\#*
+\#*\#
+*~
 .tox
+.eggs
 AUTHORS
 ChangeLog
 *.egg
@@ -8,3 +12,4 @@ build/*
 *.pyc
 doc/build/*
 doc/source/api/*
+*.log*
