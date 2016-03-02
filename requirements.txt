@@ -1,6 +1,13 @@
 pbr>=0.6,!=0.7,<1.0
 
 gerritlib
+# irc depends on jaraco modules. jaraco.functools 1.6 attempts to import
+# backports which do not exist. This appears to be a dependency issue
+# upstream. Avoid this by forcing the use of older jaraco.functools.
+pycrypto>=2.6
+jaraco.functools<1.6
+jaraco.itertools<1.6
+jaraco.collections<1.2
 irc
 pyyaml
-python-daemon
+python-daemon>=2.0.4,<2.1.0

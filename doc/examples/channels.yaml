@@ -1,0 +1,8 @@
+testproj:
+  events:
+    - patchset-created
+    - change-merged
+  branches:
+    - master
+  projects:
+    - testproject
