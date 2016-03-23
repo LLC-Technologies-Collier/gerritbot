@@ -3,6 +3,7 @@
 
 #    Copyright 2011 OpenStack LLC
 #    Copyright 2012 Hewlett-Packard Development Company, L.P.
+#    Copyright 2016 The Linux Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -16,56 +17,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-# The configuration file should look like:
+# For examples of gerritbot configuration files, see:
+#  https://github.com/LLC-Technologies-Collier/gerritbot/tree/master/doc/examples/gerritbot.yaml
+#  https://github.com/LLC-Technologies-Collier/gerritbot/tree/master/doc/examples/channels.yaml
 
-# The yaml channel config should look like:
-
-"""
-[ircbot]
-nick=NICKNAME
-pass=PASSWORD
-server=irc.freenode.net
-port=6667
-force_ssl=false
-server_password=SERVERPASS
-channel_config=/etc/gerritbot/channels.yaml
-pid=/var/run/gerritbot/gerritbot.pid
-
-[gerrit]
-user=gerrit2
-key=/path/to/id_rsa
-host=review.example.com
-port=29418
-
-[loggers]
-keys=root
-
-[logger_root]
-handlers=file
-level=ERROR
-
-[formatters]
-keys=simple
-
-[formatter_simple]
-format=%(asctime)s - %(name)s - %(levelname)s - %(message)s
-
-[handlers]
-keys=file
-
-[handler_file]
-class=handlers.TimedRotatingFileHandler
-interval=midnight
-backupCount=5
-formatter=simple
-level=INFO
-args=('/var/log/gerritbot/gerritbot.log',)
-"""
-
-import ConfigParser
 import daemon
 import getopt
+import irc
 import irc.bot
+import logging
 import logging.config
 import os
 import paramiko
@@ -75,8 +35,6 @@ import sys
 import threading
 import time
 import yaml
-
-paramiko.util.log_to_file('ssh.log')  # sets up logging
 
 try:
     import daemon.pidlockfile
@@ -95,35 +53,158 @@ except Exception:
 
 irc.client.ServerConnection.buffer_class.errors = 'replace'
 
+log = None
+
+
+def main():
+    print('Launching gerritbot')
+
+    try:
+        (opts, args) = getopt.getopt(sys.argv[1:],
+                                     'vhc:f', ['verbose', 'help', 'config'])
+    except getopt.GetoptError as err:
+        # print help information and exit:
+        print(str(err))
+        usage()
+        sys.exit(2)
+
+    verbose = False
+    foreground = False
+
+    config_file = '/etc/gerritbot/gerritbot.yaml'
+
+    for (o, a) in opts:
+        if o in ('-v', '--verbose'):
+            verbose = True
+        elif o in ('-h', '--help'):
+            usage()
+            sys.exit(1)
+        elif o in ('-c', '--config'):
+            config_file = a
+        elif o == '-f':
+            foreground = True
+
+    if not os.path.exists(config_file):
+        raise Exception('Unable to read config file at %s'
+                        % config_file)
+
+    print('Reading config from ' + config_file)
+    config = yaml.load(open(config_file))
+
+    gcfg = config['general']
+
+    # read config files if they are not inline
+    for filekey, confkey in {'channel_config': 'channels',
+                             'log_config': 'logging',
+                             'bot_config': 'ircbot',
+                             'gerrit_config': 'gerrit'}.iteritems():
+        if filekey in gcfg and gcfg[filekey] != 'inline':
+            config[confkey] = yaml.load(open(gcfg[filekey]))
+
+    logconfig = config['logging']
+
+    if verbose:
+        l = logconfig['loggers']
+        print("Turning verbosity up to 11")
+
+        maxdebug = {'handlers': ['file', 'syslog', 'console'],
+                    'level': logging.DEBUG,
+                    'qualname': None}
+
+        for k in logconfig['handlers'].keys():
+            logconfig['handlers'][k]['level'] = logging.DEBUG
+
+        for qualname in logging.Logger.manager.loggerDict.keys():
+            logger = logging.getLogger(qualname)
+            logger.handlers = []
+            logger.propogate = False
+            l[qualname] = maxdebug.copy()
+            l[qualname]['qualname'] = qualname
+
+        for qualname in l.keys():
+            l[qualname] = maxdebug.copy()
+            l[qualname]['qualname'] = qualname
+
+#        l['root']['level'] = logging.CRITICAL
+        del l['irc']
+
+    logging.config.dictConfig(logconfig)
+
+    for qualname in logging.Logger.manager.loggerDict.keys():
+        print ('qualname: ' + qualname)
+
+    global log
+
+    log = logging.getLogger('gerritbot')
+    log.propogate = False
+
+    log.debug('Logging initialized for gerritbot')
+
+    if foreground is False:
+        pidfile = '/tmp/gerritbot.pid'
+        if 'pid' in config['ircbot']:
+            pidfile = config['ircbot']['pid']
+
+        log.debug('PID path: ' + pidfile)
+        ensure_dir(pidfile)
+
+        pid = pid_file_module.TimeoutPIDLockFile(pidfile, 10)
+        log.debug('starting daemonized')
+        with daemon.DaemonContext(pidfile=pid):
+            _main(config)
+    else:
+        log.debug('starting in foreground')
+        _main(config)
+
 
 class GerritBot(irc.bot.SingleServerIRCBot):
 
-    def __init__(self,
-                 channels,
-                 nickname,
-                 password,
-                 server,
-                 port=6667,
-                 force_ssl=False,
-                 server_password=None):
-        log = logging.getLogger('gerritbot')
-        log.debug('initializing GerritBot object')
+    def __init__(self, config):
 
-        if force_ssl or port == 6697:
-            factory = irc.connection.Factory(wrapper=ssl.wrap_socket)
-            super(GerritBot, self).__init__([(server, port,
-                                              server_password)], nickname,
-                                            nickname, connect_factory=factory)
+        log.debug('initializing GerritBot object')
+        self.channel_list = config['channels']
+
+        botconfig = config['ircbot']
+
+        self.password = botconfig['pass']
+        self.port = int(botconfig['port'])
+        self.server = botconfig['server']
+
+        if 'server_password' not in botconfig:
+            botconfig['server_password'] = None
+        if 'force_ssl' not in botconfig:
+            botconfig['force_ssl'] = 'False'
+        if 'nick' not in botconfig:
+            botconfig['nick'] = 'gerritbot'
+        if 'realname' not in botconfig:
+            botconfig['realname'] = botconfig['nick']
+
+        self.server_password = botconfig['server_password']
+        self.force_ssl = bool(botconfig['force_ssl'])
+        self.nickname = botconfig['nick']
+        self.realname = botconfig['realname']
+
+        sspec = irc.bot.ServerSpec(self.server,
+                                   self.port,
+                                   self.server_password)
+
+        fmt = 'connecting to server %s %s ssl'
+        c = irc.connection
+
+        if self.force_ssl or self.port == 6697:
+            log.debug(fmt % (self.server, 'with'))
+            factory = c.Factory(wrapper=ssl.wrap_socket)
         else:
-            super(GerritBot, self).__init__([(server, port, server_password)],
-                                            nickname, nickname)
-        self.channel_list = channels
-        self.nickname = nickname
-        self.password = password
-        self.log = logging.getLogger('root')
+            log.debug(fmt % (self.server, 'without'))
+            factory = c.Factory()
+
+        super(GerritBot, self).__init__([sspec],
+                                        self.nickname,
+                                        self.realname,
+                                        connect_factory=factory)
 
     def on_nicknameinuse(self, c, e):
-        self.log.info('Nick previously in use, recovering.')
+        log.info('Nick previously in use, recovering.')
         c.nick(c.get_nickname() + '_')
         c.privmsg('nickserv', 'identify %s ' % self.password)
         c.privmsg('nickserv', 'ghost %s %s' % (self.nickname,
@@ -132,49 +213,45 @@ class GerritBot(irc.bot.SingleServerIRCBot):
                                                  self.password))
         time.sleep(1)
         c.nick(self.nickname)
-        self.log.info('Nick previously in use, recovered.')
+        log.info('Nick previously in use, recovered.')
 
     def on_welcome(self, c, e):
-        self.log.info('Identifying with IRC server.')
+        log.info('Identifying with IRC server.')
         c.privmsg('nickserv', 'identify %s ' % self.password)
-        self.log.info('Identified with IRC server.')
+        log.info('Identified with IRC server.')
         for channel in self.channel_list:
             c.join(channel)
-            self.log.info('Joined channel %s' % channel)
+            log.info('Joined channel %s' % channel)
             time.sleep(0.5)
 
     def send(self, channel, msg):
-        self.log.info('Sending "%s" to %s' % (msg, channel))
+        log.info('Sending "%s" to %s' % (msg, channel))
         try:
             self.connection.privmsg(channel, msg)
             time.sleep(0.5)
         except Exception:
-            self.log.exception('Exception sending message:')
+            log.exception('Exception sending message:')
             self.connection.reconnect()
 
 
 class Gerrit(threading.Thread):
 
-    def __init__(
-        self,
-        ircbot,
-        channel_config,
-        server,
-        username,
-        port=29418,
-        keyfile=None,
-    ):
-        log = logging.getLogger('gerritbot')
+    def __init__(self, ircbot, config):
         log.debug('initializing Gerrit object')
+
+        cfg = config['gerrit']
+
+        if 'sshlog' in cfg:
+            paramiko.util.log_to_file(cfg['sshlog'])
 
         super(Gerrit, self).__init__()
         self.ircbot = ircbot
-        self.channel_config = channel_config
-        self.log = logging.getLogger('gerritbot')
-        self.server = server
-        self.username = username
-        self.port = port
-        self.keyfile = keyfile
+        self.channel_config = config['channels']
+        self.server = cfg['host']
+        self.username = cfg['user']
+        self.port = int(cfg['port'])
+        log.debug('key: ' + cfg['key'])
+        self.keyfile = cfg['key']
         self.connected = False
 
     def connect(self):
@@ -182,14 +259,17 @@ class Gerrit(threading.Thread):
         # Import here because it needs to happen after daemonization
 
         import gerritlib.gerrit
+        for qualname in logging.Logger.manager.loggerDict.keys():
+            print("qualname: " + qualname)
+
         try:
             self.gerrit = gerritlib.gerrit.Gerrit(self.server, self.username,
                                                   self.port, self.keyfile)
             self.gerrit.startWatching()
-            self.log.info('Start watching Gerrit event stream.')
+            log.info('Start watching Gerrit event stream.')
             self.connected = True
         except Exception:
-            self.log.exception('Exception while connecting to gerrit')
+            log.exception('Exception while connecting to gerrit')
             self.connected = False
 
             # Delay before attempting again.
@@ -200,7 +280,7 @@ class Gerrit(threading.Thread):
         changevals = data['patchSet']['uploader']['name'], (
             data['change'][k] for k in ['project', 'subject', 'url'])
         msg = '%s proposed %s: %s  %s' % changevals
-        self.log.info('Compiled Message %s: %s' % (channel, msg))
+        log.info('Compiled Message %s: %s' % (channel, msg))
         self.ircbot.send(channel, msg)
 
     def ref_updated(self, channel, data):
@@ -213,16 +293,15 @@ class Gerrit(threading.Thread):
                   % (data['submitter']['username'],
                      data['refUpdate']['project'],
                      tag)
-            self.log.info('Compiled Message %s: %s' % (channel, msg))
+            log.info('Compiled Message %s: %s' % (channel, msg))
             self.ircbot.send(channel, msg)
 
     def comment_added(self, channel, data):
-        msg = \
-            'A comment has been added to a proposed change to %s: %s  %s' \
+        msg = 'A comment has been added to a proposed change to %s: %s  %s' \
             % (data['change']['project'],
                data['change']['subject'],
                data['change']['url'])
-        self.log.info('Compiled Message %s: %s' % (channel, msg))
+        log.info('Compiled Message %s: %s' % (channel, msg))
         self.ircbot.send(channel, msg)
 
         for approval in data.get('approvals', []):
@@ -234,21 +313,20 @@ class Gerrit(threading.Thread):
                     % (data['change']['project'],
                        data['change']['subject'],
                        data['change']['url'])
-                self.log.info('Compiled Message %s: %s' % (channel,
-                                                           msg))
+                log.info('Compiled Message %s: %s' % (channel,
+                                                      msg))
                 self.ircbot.send(channel, msg)
 
             if approval['type'] == 'VRIF' and approval['value'] == '2' \
                 and channel \
                 in self.channel_config.events.get('x-vrif-plus-2',
                                                   set()):
-                msg = \
-                    'Verification of a change to %s succeeded: %s  %s' \
+                msg = 'Verification of a change to %s succeeded: %s  %s' \
                     % (data['change']['project'],
                        data['change']['subject'],
                        data['change']['url'])
-                self.log.info('Compiled Message %s: %s' % (channel,
-                                                           msg))
+                log.info('Compiled Message %s: %s' % (channel,
+                                                      msg))
                 self.ircbot.send(channel, msg)
 
             if approval['type'] == 'CRVW' and approval['value'] == '-2' \
@@ -259,8 +337,8 @@ class Gerrit(threading.Thread):
                     % (data['change']['project'],
                        data['change']['subject'],
                        data['change']['url'])
-                self.log.info('Compiled Message %s: %s' % (channel,
-                                                           msg))
+                log.info('Compiled Message %s: %s' % (channel,
+                                                      msg))
                 self.ircbot.send(channel, msg)
 
             if approval['type'] == 'CRVW' and approval['value'] == '2' \
@@ -271,8 +349,8 @@ class Gerrit(threading.Thread):
                     % (data['change']['project'],
                        data['change']['subject'],
                        data['change']['url'])
-                self.log.info('Compiled Message %s: %s' % (channel,
-                                                           msg))
+                log.info('Compiled Message %s: %s' % (channel,
+                                                      msg))
                 self.ircbot.send(channel, msg)
 
     def change_merged(self, channel, data):
@@ -280,18 +358,16 @@ class Gerrit(threading.Thread):
               % (data['change']['project'],
                  data['change']['subject'],
                  data['change']['url'])
-        self.log.info('Compiled Message %s: %s' % (channel, msg))
+        log.info('Compiled Message %s: %s' % (channel, msg))
         self.ircbot.send(channel, msg)
 
     def _read(self, data):
         try:
             if data['type'] == 'ref-updated':
-                channel_set = \
-                    self.channel_config.events.get('ref-updated')
+                channel_set = self.channel_config.events.get('ref-updated')
             else:
-                channel_set = \
-                    self.channel_config.projects.get(data['change'
-                                                          ]['project'], set()) \
+                channel_set = self.channel_config.projects.get(data['change'
+                                                                    ]['project'], set()) \
                     & self.channel_config.events.get(data['type'],
                                                      set()) \
                     & self.channel_config.branches.get(data['change'
@@ -302,8 +378,8 @@ class Gerrit(threading.Thread):
             # this event.
 
             channel_set = set()
-        self.log.info('Potential channels to receive event notification: %s'
-                      % channel_set)
+        log.info('Potential channels to receive event notification: %s'
+                 % channel_set)
         for channel in channel_set:
             if data['type'] == 'comment-added':
                 self.comment_added(channel, data)
@@ -320,11 +396,11 @@ class Gerrit(threading.Thread):
                 self.connect()
             try:
                 event = self.gerrit.getEvent()
-                self.log.info('Received event: %s' % event)
+                log.info('Received event: %s' % event)
                 self._read(event)
             except Exception:
-                self.log.exception('Exception encountered in event loop'
-                                   )
+                log.exception('Exception encountered in event loop'
+                              )
                 if not self.gerrit.watcher_thread.is_alive():
 
                     # Start new gerrit connection. Don't need to restart IRC
@@ -336,7 +412,6 @@ class Gerrit(threading.Thread):
 class ChannelConfig(object):
 
     def __init__(self, data):
-        log = logging.getLogger('gerritbot')
         log.debug('initializing ChannelConfig object')
         self.data = data
         keys = data.keys()
@@ -366,54 +441,13 @@ class ChannelConfig(object):
 
 
 def _main(config):
-    log = logging.getLogger('gerritbot')
     log.debug('running _main')
 
-    log.debug('Retrieving ircbot section from config')
-    filename = config.get('ircbot', 'channel_config')
-    if filename:
-        log.debug('ircbot section retrieved')
-        log.debug('expanding filename ' + filename)
-        filename = os.path.expanduser(filename)
-        if not os.path.exists(filename):
-            errstr = 'Unable to read layout config file at %s' \
-                % filename
-            log.err(errstr)
-            raise Exception(errstr)
-    else:
-        errstr = 'Channel Config must be specified in config file.'
-        log.exception(errstr)
-        raise Exception(errstr)
-
-    log.debug('reading channel config')
-    try:
-        channel_config = ChannelConfig(yaml.load(open(filename)))
-    except Exception:
-        errstr = 'Syntax error in chanel config file'
-        log.exception(errstr)
-        raise
-    log.debug('channel config read')
-
     log.debug('instantiating bot object')
-    botargs = [config.get('ircbot', k) for k in [
-        'nick',
-        'pass',
-        'server',
-        'port',
-        'force_ssl',
-        'server_password',
-    ]]
-    log.debug('bot args: ' + ','.join(botargs))
-    botargs[3] = int(botargs[3])
-    botargs[4] = bool(botargs[4])
-    bot = GerritBot(channel_config.channels, *botargs)
+    bot = GerritBot(config)
 
     log.debug('instantiating gerrit object')
-    gerritargs = [config.get('gerrit', k) for k in ['host', 'user',
-                                                    'port', 'key']]
-    log.debug('gerrit args: ' + ','.join(gerritargs))
-    gerritargs[2] = int(gerritargs[2])
-    g = Gerrit(bot, channel_config, *gerritargs)
+    g = Gerrit(bot, config)
 
     g.start()
     bot.start()
@@ -430,73 +464,7 @@ def usage():
           + '-h --help           Show help\n'
           + '-f                  Run in foreground\n'
           + '-c --config <file>  Read configuration from <file>\n'
-          + '                    (default: /etc/gerritbot/gerritbot.conf)')
-
-
-def main():
-    print('Launching gerritbot')
-
-    try:
-        (opts, args) = getopt.getopt(sys.argv[1:],
-                                     'vhc:f', ['verbose', 'help', 'config'])
-    except getopt.GetoptError as err:
-        # print help information and exit:
-        print(str(err))
-        usage()
-        sys.exit(2)
-
-    verbose = False
-    foreground = False
-    config_file = '/etc/gerritbot/gerritbot.conf'
-
-    for (o, a) in opts:
-        if o in ('-v', '--verbose'):
-            verbose = True
-        elif o in ('-h', '--help'):
-            usage()
-            sys.exit(1)
-        elif o in ('-c', '--config'):
-            config_file = a
-        elif o == '-f':
-            foreground = True
-
-    if not os.path.exists(config_file):
-        raise Exception('Unable to read config file at %s'
-                        % config_file)
-
-    print('Reading log file config from ' + config_file)
-    logging.config.fileConfig(config_file)
-    log = logging.getLogger('gerritbot')
-
-    if verbose is True:
-        log.setLevel(logging.DEBUG)
-
-    log.debug('Logging initialized for gerritbot')
-
-    log.debug('Initializing config file parser.')
-    config = ConfigParser.ConfigParser({'force_ssl': 'false',
-                                        'server_password': None})
-
-    log.debug('Reading remainder of config file ' + config_file)
-    config.read(config_file)
-
-    pid_path = ''
-    if config.has_option('ircbot', 'pid'):
-        pid_path = config.get('ircbot', 'pid')
-    else:
-        pid_path = '/tmp/gerritbot.pid'
-
-    log.debug('PID path: ' + pid_path)
-    ensure_dir(pid_path)
-    pid = pid_file_module.TimeoutPIDLockFile(pid_path, 10)
-    if foreground is False:
-        log.debug('starting daemon')
-        with daemon.DaemonContext(pidfile=pid):
-            _main(config)
-    else:
-        log.debug('starting in foreground')
-        _main(config)
-
+          + '                    (default: /etc/gerritbot/gerritbot.yaml)')
 
 if __name__ == '__main__':
     main()

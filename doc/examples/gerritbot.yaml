@@ -1,0 +1,82 @@
+general:
+  log_config: inline
+  bot_config: inline
+  gerrit_config: inline
+  channel_config: inline
+
+ircbot:
+  nick: gerritbot
+  pass: nunyabiz
+  server: hype0
+  force_ssl: False
+  port: 6667
+  server_password: SERVERPASS
+  pid: doc/examples/gerritbot.pid
+
+gerrit:
+  user: admin
+  key: doc/examples/insecure_id_rsa
+  host: hype0
+  port: 29418
+  sshlog: ssh.log
+
+logging:
+  version: 1
+  formatters:
+    simple:
+      format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  handlers:
+    file:
+      class: logging.handlers.TimedRotatingFileHandler
+      formatter: simple
+      filename: gerritbot.log
+      backupCount: 5
+    syslog:
+      class: logging.handlers.SysLogHandler
+      level: WARN
+      formatter: simple
+      address: /dev/log
+    console:
+      class : logging.StreamHandler
+      formatter: simple
+      level: DEBUG
+      stream: ext://sys.stdout
+  loggers:
+    root:
+      handlers: ['file','syslog','console']
+      level: DEBUG
+      qualname: root
+    'irc.client':
+      handlers: ['file','syslog','console']
+      level: DEBUG
+      qualname: 'irc.client'
+    'paramiko.transport':
+      handlers: ['file','syslog','console']
+      level: DEBUG
+      qualname: 'paramiko.transport'
+    'gerrit.Gerrit':
+      handlers: ['file','syslog','console']
+      level: DEBUG
+      qualname: 'gerrit.Gerrit'
+    'gerrit.GerritWatcher':
+      handlers: ['file','syslog','console']
+      level: DEBUG
+      qualname: 'gerrit.GerritWatcher'
+    gerritbot:
+      handlers: ['file','syslog','console']
+      level: DEBUG
+      qualname: gerritbot
+
+channels:
+  '#testproj':
+    events:
+      - patchset-created
+      - change-merged
+      - ref-updated
+      - change-merged
+      - project-created
+    projects:
+      - testproject
+    branches:
+      - master
+      - development
